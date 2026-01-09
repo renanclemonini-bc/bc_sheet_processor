@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Dict
 from uuid import uuid4
 
+import redis
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -19,11 +20,38 @@ app.mount("/img", StaticFiles(directory="templates/img"), name="images")
 # Configurações
 templates = Jinja2Templates(directory="templates")
 executor = ThreadPoolExecutor(max_workers=3)
-jobs_status: Dict[str, dict] = {}
+
+# Configuração Redis (adicione depois de 'executor = ...')
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
 # Cria diretórios necessários
 os.makedirs("uploads", exist_ok=True)
 os.makedirs("output", exist_ok=True)
+
+def get_job_status(job_id: str):
+    """Pega status do job no Redis"""
+    data = redis_client.get(f"job:{job_id}")
+    if data:
+        return json.loads(data)
+    return None
+
+
+def set_job_status(job_id: str, status_data: dict):
+    """Salva status do job no Redis (expira em 1 hora)"""
+    redis_client.setex(
+        f"job:{job_id}",
+        3600,  # 1 hora
+        json.dumps(status_data)
+    )
+
+
+def update_job_progress(job_id: str, progress: int):
+    """Atualiza apenas o progresso"""
+    job = get_job_status(job_id)
+    if job:
+        job['progresso'] = progress
+        set_job_status(job_id, job)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -54,11 +82,11 @@ async def upload_excel(file: UploadFile = File(...)):
         f.write(conteudo)
 
     # Marca como processando
-    jobs_status[job_id] = {
+    set_job_status(job_id, {
         "status": "processing",
         "arquivo_original": file.filename,
         "progresso": 0,
-    }
+    })
 
     # Executa processamento em background
     loop = asyncio.get_event_loop()
@@ -73,20 +101,19 @@ async def upload_excel(file: UploadFile = File(...)):
         "status_url": f"/status/{job_id}",
     }
 
-
 @app.get("/status/{job_id}")
 async def verificar_status(job_id: str):
     """Verifica status do processamento"""
     print(f"[STATUS] Verificando job: {job_id}")
-    print(f"[STATUS] Jobs disponíveis: {list(jobs_status.keys())}")
-
-    if job_id not in jobs_status:
+    
+    job = get_job_status(job_id)
+    
+    if not job:
         print(f"[STATUS] Job {job_id} NÃO ENCONTRADO!")
         raise HTTPException(404, detail="Job não encontrado")
-    status_atual = jobs_status[job_id]
-    print(f"[STATUS] Status do job {job_id}: {status_atual}")
-
-    return status_atual
+    
+    print(f"[STATUS] Status do job {job_id}: {job}")
+    return job
 
 
 @app.get("/download/{job_id}")
@@ -98,12 +125,11 @@ async def download_arquivo(job_id: str):
     # progress_file = f"uploads/{job_id}_progress.json"
 
     # ✅ USA O DICIONÁRIO EM MEMÓRIA
-    if job_id not in jobs_status:
-        print(f"[DOWNLOAD] Job {job_id} não encontrado")
-        print(f"[DOWNLOAD] Jobs disponíveis: {list(jobs_status.keys())}")
-        raise HTTPException(404, detail="Job não encontrado")
+    job = get_job_status(job_id)
 
-    job = jobs_status[job_id]
+    if not job:
+        print(f"[DOWNLOAD] Job {job_id} não encontrado")
+        raise HTTPException(404, detail="Job não encontrado")
 
     print(f"[DOWNLOAD] Job encontrado: {job}")
 
@@ -189,7 +215,7 @@ def processar_excel_background(arquivo_entrada: str, job_id: str, nome_original:
             linhas_originais = ws.max_row
             colunas_originais = ws.max_column
 
-            jobs_status[job_id]["progresso"] = 10
+            update_job_progress(job_id, 10)
 
             # Lê headers
             headers = [
@@ -216,7 +242,7 @@ def processar_excel_background(arquivo_entrada: str, job_id: str, nome_original:
                 )
 
             linhas_em_branco = 0
-            jobs_status[job_id]["progresso"] = 30
+            update_job_progress(job_id, 30)
 
             # Processa cada linha
             for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True)):
@@ -279,7 +305,7 @@ def processar_excel_background(arquivo_entrada: str, job_id: str, nome_original:
                 # Atualiza progresso a cada 100 linhas
                 if row_idx % 100 == 0 and linhas_originais > 0:
                     progresso = 30 + int((row_idx / linhas_originais) * 50)
-                    jobs_status[job_id]["progresso"] = min(progresso, 80)
+                    update_job_progress(job_id, min(progresso, 80))
 
             # Fecha o workbook original
             wb.close()
@@ -308,7 +334,7 @@ def processar_excel_background(arquivo_entrada: str, job_id: str, nome_original:
 
             wb.close()
 
-        jobs_status[job_id]["progresso"] = 85
+        update_job_progress(job_id, 85)
 
         # Validação antes de criar arquivo
         if len(novo_dados) == 0:
@@ -359,10 +385,10 @@ def processar_excel_background(arquivo_entrada: str, job_id: str, nome_original:
             print(f"[{job_id}] ✗ AVISO: Arquivo pode estar corrompido: {str(e)}")
             raise Exception(f"Arquivo gerado está corrompido: {str(e)}")
 
-        jobs_status[job_id]["progresso"] = 100
+        update_job_progress(job_id, 100)
 
         # Marca como concluído
-        jobs_status[job_id] = {
+        set_job_status(job_id, {
             "status": "completed",
             "arquivo_saida": caminho_saida,
             "nome_arquivo": nome_saida,
@@ -376,7 +402,7 @@ def processar_excel_background(arquivo_entrada: str, job_id: str, nome_original:
                 "linhas_em_branco": linhas_em_branco,
                 "colunas_em_branco": colunas_em_branco,
             },
-        }
+        })
 
         print(f"[{job_id}] ✓ Processamento concluído!")
         print(
@@ -391,12 +417,12 @@ def processar_excel_background(arquivo_entrada: str, job_id: str, nome_original:
 
         traceback.print_exc()
 
-        jobs_status[job_id] = {
+        set_job_status(job_id, {
             "status": "error",
             "error": str(e),
             "arquivo_original": nome_original,
             "progresso": 0,
-        }
+        })
 
     finally:
         # Remove arquivo temporário

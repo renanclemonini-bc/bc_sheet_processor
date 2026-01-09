@@ -10,7 +10,11 @@ services:
       - ./templates:/app/templates
     environment:
       - PYTHONUNBUFFERED=1
+      - REDIS_URL=redis://redis:6379
     restart: always
+    depends_on:
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/"]
       interval: 30s
@@ -25,3 +29,28 @@ services:
         reservations:
           cpus: '0.5'
           memory: 512M
+
+  redis:
+    image: redis:7-alpine
+    container_name: bc_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+volumes:
+  redis_data:

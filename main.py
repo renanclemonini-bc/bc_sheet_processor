@@ -22,32 +22,41 @@ templates = Jinja2Templates(directory="templates")
 executor = ThreadPoolExecutor(max_workers=3)
 
 # Configuração Redis (adicione depois de 'executor = ...')
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+# REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+# redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+
+try:
+    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client.ping()  # Testa conexão
+    USE_REDIS = True
+    print("✓ Redis conectado")
+except Exception as e:
+    print(f"✗ Redis indisponível: {e}")
+    print("⚠ Usando memória local (não funciona com múltiplos workers)")
+    USE_REDIS = False
+    jobs_status_fallback = {}
 
 # Cria diretórios necessários
 os.makedirs("uploads", exist_ok=True)
 os.makedirs("output", exist_ok=True)
 
 def get_job_status(job_id: str):
-    """Pega status do job no Redis"""
-    data = redis_client.get(f"job:{job_id}")
-    if data:
-        return json.loads(data)
-    return None
-
+    if USE_REDIS:
+        data = redis_client.get(f"job:{job_id}")
+        if data:
+            return json.loads(data)
+        return None
+    else:
+        return jobs_status_fallback.get(job_id)
 
 def set_job_status(job_id: str, status_data: dict):
-    """Salva status do job no Redis (expira em 1 hora)"""
-    redis_client.setex(
-        f"job:{job_id}",
-        3600,  # 1 hora
-        json.dumps(status_data)
-    )
-
+    if USE_REDIS:
+        redis_client.setex(f"job:{job_id}", 3600, json.dumps(status_data))
+    else:
+        jobs_status_fallback[job_id] = status_data
 
 def update_job_progress(job_id: str, progress: int):
-    """Atualiza apenas o progresso"""
     job = get_job_status(job_id)
     if job:
         job['progresso'] = progress

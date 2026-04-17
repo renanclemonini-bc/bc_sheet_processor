@@ -217,9 +217,9 @@ def processar_excel_background(arquivo_entrada: str, job_id: str, nome_original:
     try:
         print(f"[{job_id}] Iniciando processamento de {nome_original}")
 
-        # Lê o arquivo Excel
+        # Lê o arquivo Excel com data_only=True para ignorar fórmulas e usar valores calculados
         with open(arquivo_entrada, "rb") as f:
-            wb = load_workbook(f)
+            wb = load_workbook(f, data_only=True)
             ws = wb.active
             linhas_originais = ws.max_row
             colunas_originais = ws.max_column
@@ -251,14 +251,32 @@ def processar_excel_background(arquivo_entrada: str, job_id: str, nome_original:
                 )
 
             linhas_em_branco = 0
+            celulas_com_formula_sem_valor = 0
+            linhas_com_problema = []
+            
             update_job_progress(job_id, 30)
 
             # Processa cada linha
-            for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True)):
+            for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
                 # Pula linhas vazias
                 if all(cell is None or str(cell).strip() == "" for cell in row):
                     linhas_em_branco += 1
                     continue
+
+                # Detecta células None que podem ser fórmulas não calculadas
+                tem_none_suspeito = False
+                for col_idx, cell in enumerate(row):
+                    if cell is None and col_idx < len(headers):
+                        col_name = headers[col_idx]
+                        # Verifica se é uma coluna importante
+                        if col_name in ['telefone', 'nome', 'primeiro nome', 'sobrenome', 'contato', 'celular']:
+                            tem_none_suspeito = True
+                            celulas_com_formula_sem_valor += 1
+                            linhas_com_problema.append(row_idx)
+                            break
+                
+                if tem_none_suspeito:
+                    continue  # Pula essa linha
 
                 primeiro_nome = ""
                 sobrenome = ""
@@ -311,7 +329,7 @@ def processar_excel_background(arquivo_entrada: str, job_id: str, nome_original:
                 if telefone and len(telefone) >= 10:
                     novo_dados.append([primeiro_nome, sobrenome, telefone, etiquetas])
 
-                # Atualiza progresso a cada 100 linhas
+                # Atualiza progresso a cada 1000 linhas
                 if row_idx % 1000 == 0 and linhas_originais > 0:
                     progresso = 30 + int((row_idx / linhas_originais) * 50)
                     update_job_progress(job_id, min(progresso, 80))
@@ -320,11 +338,16 @@ def processar_excel_background(arquivo_entrada: str, job_id: str, nome_original:
             wb.close()
 
             print(f"[{job_id}] Processadas {len(novo_dados)} linhas válidas")
+            
+            # Aviso sobre fórmulas
+            if celulas_com_formula_sem_valor > 0:
+                print(f"[{job_id}] ⚠ AVISO: {celulas_com_formula_sem_valor} células com possíveis fórmulas não calculadas foram ignoradas")
+                print(f"[{job_id}] ⚠ Linhas afetadas (primeiras 10): {linhas_com_problema[:10]}")
 
         # Conta colunas em branco (reabre o arquivo)
         colunas_em_branco = 0
         with open(arquivo_entrada, "rb") as f:
-            wb = load_workbook(f, read_only=True)
+            wb = load_workbook(f, read_only=True, data_only=True)
             ws = wb.active
 
             for col_idx in range(colunas_originais):
@@ -347,7 +370,11 @@ def processar_excel_background(arquivo_entrada: str, job_id: str, nome_original:
 
         # Validação antes de criar arquivo
         if len(novo_dados) == 0:
-            raise ValueError("Nenhuma linha válida encontrada para processar")
+            erro_msg = "Nenhuma linha válida encontrada para processar."
+            if celulas_com_formula_sem_valor > 0:
+                erro_msg += f"\n\nDetectadas {celulas_com_formula_sem_valor} células com possíveis fórmulas não calculadas."
+                erro_msg += "\n\nSOLUÇÃO: Abra o arquivo no Excel, pressione F9 para recalcular todas as fórmulas, salve o arquivo e tente novamente."
+            raise ValueError(erro_msg)
 
         print(f"[{job_id}] Criando novo arquivo Excel...")
 
@@ -396,8 +423,15 @@ def processar_excel_background(arquivo_entrada: str, job_id: str, nome_original:
 
         update_job_progress(job_id, 100)
 
+        # Prepara mensagem de aviso se houver fórmulas
+        aviso_formulas = None
+        if celulas_com_formula_sem_valor > 0:
+            aviso_formulas = f"{celulas_com_formula_sem_valor} células com possíveis fórmulas não calculadas foram ignoradas. Linhas afetadas: {', '.join(map(str, linhas_com_problema[:10]))}"
+            if len(linhas_com_problema) > 10:
+                aviso_formulas += f" e mais {len(linhas_com_problema) - 10}..."
+
         # Marca como concluído
-        set_job_status(job_id, {
+        resultado = {
             "status": "completed",
             "arquivo_saida": caminho_saida,
             "nome_arquivo": nome_saida,
@@ -411,7 +445,12 @@ def processar_excel_background(arquivo_entrada: str, job_id: str, nome_original:
                 "linhas_em_branco": linhas_em_branco,
                 "colunas_em_branco": colunas_em_branco,
             },
-        })
+        }
+        
+        if aviso_formulas:
+            resultado["aviso_formulas"] = aviso_formulas
+        
+        set_job_status(job_id, resultado)
 
         print(f"[{job_id}] ✓ Processamento concluído!")
         print(
@@ -419,6 +458,8 @@ def processar_excel_background(arquivo_entrada: str, job_id: str, nome_original:
         )
         print(f"[{job_id}] Novo arquivo: {len(novo_dados) + 1} linhas x 4 colunas")
         print(f"[{job_id}] Arquivo salvo em: {caminho_saida}")
+        if aviso_formulas:
+            print(f"[{job_id}] ⚠ {aviso_formulas}")
 
     except Exception as e:
         print(f"[{job_id}] ✗ Erro: {str(e)}")
